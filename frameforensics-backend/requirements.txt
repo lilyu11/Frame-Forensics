@@ -1,0 +1,17 @@
+# Data Prep & Processing
+opencv-python
+mediapipe
+pandas
+numpy
+tqdm
+pyyaml
+matplotlib
+scikit-learn
+
+# Deep Learning Framework (PyTorch)
+torch
+torchvision
+
+# Optimization & Export
+onnx
+onnxruntime

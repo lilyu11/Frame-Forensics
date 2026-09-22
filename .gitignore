@@ -1,0 +1,11 @@
+# Dataset
+frameforensics-backend/archive.zip
+frameforensics-backend/archive/*
+frameforensics-backend/processed_data/*
+
+# Cache
+frameforensics-backend/processed_data/model_cache/*
+frameforensics-backend/app/__pycache__/*
+
+# Môi trường ngoài
+.vscode/*
