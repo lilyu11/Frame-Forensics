@@ -1,12 +1,15 @@
 import os
+import urllib.request
+
 import cv2
-import pandas as pd
 import numpy as np
+import pandas as pd
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
 from pathlib import Path
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-
-import urllib.request
 
 
 # Cấu hình đường dẫn
@@ -37,11 +40,10 @@ ENABLE_QUALITY_FILTER = True
 # MediaPipe face confidence (detection score)
 FACE_CONF_THRESHOLD = 0.5
 
-# blur score = Laplacian variance (tính trên ảnh crop trước khi resize)
-# [Lưu ý] threshold nên tinh chỉnh sau khi chạy thử 1 vài subset.
+# Blur score = Laplacian variance (tính trên ảnh crop trước khi resize)
 BLUR_THRESHOLD = 50.0
 
-# bbox area ratio = area(bbox) / area(image)
+# Bbox area ratio = area(bbox) / area(image)
 MIN_BBOX_AREA_RATIO = 0.001
 
 # Khi đã có file ảnh .jpg ở disk:
@@ -49,83 +51,39 @@ MIN_BBOX_AREA_RATIO = 0.001
 # Nếu QUALITY filter tắt: skip để tăng tốc
 SKIP_EXISTING_IF_QUALITY_DISABLED = True
 
-# Khởi tạo Face Detection bằng OpenCV Haar Cascade
-face_detector_backend = None  # "opencv_haar"
-face_detector = None  # cv2.CascadeClassifier
+# Khởi tạo Face Detection bằng MediaPipe Tasks
+face_detector = None  # vision.FaceDetector
 
 
 def init_face_detector():
-	"""Lazy init của OpenCV Haar face detector"""
-	global face_detector_backend, face_detector
-	if face_detector is not None and face_detector_backend == "opencv_haar":
+	"""Lazy init của MediaPipe Tasks Face Detector."""
+	global face_detector
+	if face_detector is not None:
 		return
 
-	candidate_paths = []
-	try:
-		base = getattr(cv2, "data", None)
-		if base is not None and getattr(base, "haarcascades", None):
-			candidate_paths.append(base.haarcascades + "haarcascade_frontalface_default.xml")
-	except Exception:
-		pass
+	cache_dir = OUTPUT_BASE_DIR / "model_cache"
+	cache_dir.mkdir(parents=True, exist_ok=True)
+	model_path = cache_dir / "blaze_face_short_range.tflite"
 
-	# Fallback tìm trong site-packages/cv2 theo đuôi tên file
-	""" Hơi (?) để sau xét xem có cần kh thì bỏ """
-	try:
-		import sys
-		from pathlib import Path as _Path
-		import cv2 as _cv2
-		cv2_root = _Path(_cv2.__file__).resolve().parent
-		for p in cv2_root.rglob("haarcascade_frontalface_default.xml"):
-			candidate_paths.append(str(p))
-	except Exception:
-		pass
+	# Tự động tải model file chính thức của MediaPipe Tasks nếu chưa có
+	if not model_path.exists():
+		url = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
+		print(f"[MediaPipe Tasks] Downloading model: {url}")
+		try:
+			urllib.request.urlretrieve(url, str(model_path))
+		except Exception as e:
+			raise RuntimeError(f"[X] Không thể tải model MediaPipe Tasks. Lỗi: {e}")
 
-	haar_path = None
-	for p in candidate_paths:
-		if p and os.path.exists(p):
-			haar_path = p
-			break
-
-	if not haar_path:
-		# Final fallback: try to download Haar xml from OpenCV source.
-		# This keeps the pipeline running even when the cv2 package was built
-		# without bundled haarcascade XML assets.
-		cache_dir = OUTPUT_BASE_DIR / "model_cache"
-		cache_dir.mkdir(parents=True, exist_ok=True)
-		model_name = "haarcascade_frontalface_default.xml"
-		dst = cache_dir / model_name
-		if not dst.exists():
-			urls = [
-				"https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml",
-				"https://raw.githubusercontent.com/opencv/opencv_contrib/master/data/haarcascades/haarcascade_frontalface_default.xml",
-			]
-			last_err = None
-			for url in urls:
-				try:
-					print(f"[HaarCascade] Downloading: {url}")
-					urllib.request.urlretrieve(url, str(dst))
-					last_err = None
-					break
-				except Exception as e:
-					last_err = e
-					print(f"[HaarCascade] Failed: {url} -> {e}")
-			if not dst.exists():
-				raise RuntimeError(
-						"[X] Không tìm thấy và cũng không thể tải haarcascade_frontalface_default.xml. "
-						"Nguyên nhân gốc: " + str(last_err)
-					)
-		haar_path = str(dst)
-
-	classifier = cv2.CascadeClassifier(haar_path)
-	if classifier.empty():
-		raise RuntimeError("cv2.CascadeClassifier khởi tạo thất bại với file: " + haar_path)
-
-	face_detector = classifier
-	face_detector_backend = "opencv_haar"
-
-
-# NOTE: init_face_detector() được gọi theo kiểu lazy (trong process_crop_face)
-# để tránh crash ngay khi module được import.
+	"""
+	Đặt min_detection_confidence thấp (0.1) để MediaPipe không tự lọc bỏ sớm,
+	-> Lấy được điểm face_conf thực tế để chủ động filter ở process_videos
+	"""
+	base_options = mp_python.BaseOptions(model_asset_path=str(model_path))
+	options = vision.FaceDetectorOptions(
+		base_options=base_options,
+		min_detection_confidence=0.1
+	)
+	face_detector = vision.FaceDetector.create_from_options(options)
 
 
 # METADATA
@@ -193,53 +151,45 @@ def sanity_check_video_split(df_split: pd.DataFrame):
 # XỬ LÝ CẮT MẶT & TRÍCH FRAME
 def process_crop_face(frame_bgr, margin=0.30):
 	h, w, _ = frame_bgr.shape
-	global face_detector_backend, face_detector
-	if face_detector is None or face_detector_backend != "opencv_haar":
+	global face_detector
+	if face_detector is None:
 		init_face_detector()
 
-	if face_detector is None or face_detector_backend != "opencv_haar":
-		raise RuntimeError(
-			" [X] Không khởi tạo được OpenCV Haar face detector. "
-			f"face_detector_backend={face_detector_backend!r}, face_detector={type(face_detector)!r}"
-		)
+	# Chuyển đổi BGR sang RGB và bọc trong mp.Image
+	rgb_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+	mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
-	gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-	# Detect faces: (x, y, w, h)
-	faces = face_detector.detectMultiScale(
-		gray,
-		scaleFactor=1.1,
-		minNeighbors=5,
-		minSize=(30, 30),
-		flags=cv2.CASCADE_SCALE_IMAGE,
-	)
-	if faces is None or len(faces) == 0:
+	detection_result = face_detector.detect(mp_image)
+	if not detection_result.detections:
 		return None
 
-	# Chọn face có diện tích lớn nhất
-	fx, fy, fw, fh = max(faces, key=lambda r: r[2] * r[3])
-	bx, by, bw, bh = int(fx), int(fy), int(fw), int(fh)
+	# Chọn khuôn mặt có diện tích BBox lớn nhất
+	best_detection = max(
+		detection_result.detections,
+		key=lambda d: d.bounding_box.width * d.bounding_box.height
+	)
+
+	bbox = best_detection.bounding_box
+	bx, by, bw, bh = bbox.origin_x, bbox.origin_y, bbox.width, bbox.height
+
+	# Lấy confidence score thực tế từ MediaPipe Tasks
+	face_conf = float(best_detection.categories[0].score)
 	bbox_area_ratio = float((bw * bh) / (w * h)) if (w * h) > 0 else 0.0
-	# Haar không cho score tương tự MediaPipe. Ta set một giá trị đủ cao để
-	# QUALITY_FILTER vẫn chủ yếu dựa vào blur/bbox.
-	face_conf = 1.0
-	
-	# Tính margin mở rộng
+
+	# Expand margin
 	mw = int(bw * margin)
 	mh = int(bh * margin)
-	
 	x1 = max(0, bx - mw)
 	y1 = max(0, by - mh)
 	x2 = min(w, bx + bw + mw)
 	y2 = min(h, by + bh + mh)
-	
+
 	face_crop = frame_bgr[y1:y2, x1:x2]
 	if face_crop.size == 0:
 		return None
 
-	# Blur score (tính trên crop gốc trước khi resize)
 	gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
 	blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
-		
 	face_resized = cv2.resize(face_crop, TARGET_SIZE, interpolation=cv2.INTER_AREA)
 	return face_resized, face_conf, float(blur_score), float(bbox_area_ratio)
 
