@@ -78,7 +78,10 @@ def init_face_detector():
 	Đặt min_detection_confidence thấp (0.1) để MediaPipe không tự lọc bỏ sớm,
 	-> Lấy được điểm face_conf thực tế để chủ động filter ở process_videos
 	"""
-	base_options = mp_python.BaseOptions(model_asset_path=str(model_path))
+	base_options = mp_python.BaseOptions(
+			model_asset_path=str(model_path),
+			# delegate=mp_python.BaseOptions.Delegate.GPU  # <-- DIESE ZEILE HINZUFÜGEN!
+		)
 	options = vision.FaceDetectorOptions(
 		base_options=base_options,
 		min_detection_confidence=0.1
