@@ -9,3 +9,4 @@ frameforensics-backend/app/__pycache__/*
 
 # Môi trường ngoài
 .vscode/*
+archive.zip
