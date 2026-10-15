@@ -1,79 +1,84 @@
+import json
+import os
+import tempfile
+import time
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Optional, Tuple
+
 import cv2
+import gradio as gr
+import imageio_ffmpeg
 import numpy as np
 import onnxruntime as ort
-import gradio as gr
-import time
+
+from face_crop import FaceCropper, preprocess_crop
+
+# CONFIG
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
+MODEL_PATH = Path(os.environ.get(
+    "FF_MODEL_PATH", BACKEND_ROOT / "models" / "frameforensics_mnv3s_fp32.onnx"))
+
+# Class order used in training (FaceDataset: REAL -> 1, everything else -> 0).
+IDX_FAKE, IDX_REAL = 0, 1
+
+FAKE_THRESHOLD = 0.5       # smoothed P(fake) above this => FAKE
+EMA_ALPHA = 0.6            # weight of the newest observation in the EMA
+SAMPLE_INTERVAL_S = 0.5    # analyse ~2 frames per second
+MAX_MISSES = 3             # consecutive sampled frames without a usable face before the verdict is dropped
+
+GREEN, RED, GRAY = (0, 255, 0), (0, 0, 255), (160, 160, 160)   # BGR
+
 
 # ONNX RUNTIME ENGINE
 class ONNXDeepfakeEngine:
-    # Khởi tạo engine ONNX Runtime (hiện chưa có)
-    def __init__(self, model_path="engine_path_chưa_có"):
-        self.model_path = model_path
-        
-        # Khởi tạo ONNX Runtime Session
-        self.session = ort.InferenceSession(self.model_path, providers=['CPUExecutionProvider'])
-        
-        # Lấy tên các node input/output của model ONNX
+    def __init__(self, model_path=MODEL_PATH):
+        self.model_path = Path(model_path)
+        if not self.model_path.exists():
+            raise FileNotFoundError(
+                f"ONNX model not found: {self.model_path}. Run export_to_onnx.ipynb first "
+                f"or set FF_MODEL_PATH.")
+
+        so = ort.SessionOptions()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        self.session = ort.InferenceSession(
+            str(self.model_path), so, providers=["CPUExecutionProvider"])
         self.input_name = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name
-        
-        print(f"[ONNXEngine] Đã nạp thành công model từ: {self.model_path}")
 
-    def preprocess(self, face_img):
-        """
-        Tiền xử lý ảnh khuôn mặt trước khi đưa vào mô hình:
-        1. Resize về kích thước chuẩn (224x224)
-        2. Chuyển đổi không gian màu BGR sang RGB
-        3. Chuẩn hóa giá trị pixel về đoạn [0, 1] và áp dụng Mean/Std chuẩn ImageNet
-        4. Chuyển chiều từ (H, W, C) sang (C, H, W) và thêm batch dimension (1, 3, 224, 224)
-        """
-        img = cv2.resize(face_img, (224, 224), interpolation=cv2.INTER_AREA)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.astype(np.float32) / 255.0
-        
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        img = (img - mean) / std
-        
-        img = np.transpose(img, (2, 0, 1))
-        img = np.expand_dims(img, axis=0)
-        return img
+        # Refuse to run if the model was exported with a different class order.
+        meta = self.session.get_modelmeta().custom_metadata_map
+        if "class_index" in meta:
+            idx = json.loads(meta["class_index"])
+            if idx != {"FAKE": IDX_FAKE, "REAL": IDX_REAL}:
+                raise ValueError(f"Model class_index {idx} does not match IDX_FAKE/IDX_REAL in app.py")
+        print(f"[ONNXEngine] Loaded: {self.model_path}")
 
-    def predict(self, face_img):
-        """
-        Thực hiện inference trực tiếp qua mô hình ONNX:
-        - Đầu vào: Ảnh khuôn mặt (numpy array BGR)
-        - Đầu ra: (label: str, confidence: float)
-        """
-        input_tensor = self.preprocess(face_img)
-        outputs = self.session.run([self.output_name], {self.input_name: input_tensor})
-        logits = outputs[0][0]  # Vector logits [Real_score, Fake_score]
-        
-        exp_logits = np.exp(logits - np.max(logits))
-        probs = exp_logits / np.sum(exp_logits)
-        
-        real_prob = float(probs[0])
-        fake_prob = float(probs[1])
-        
-        if fake_prob > real_prob:
-            label = "FAKE"
-            confidence = fake_prob
-        else:
-            label = "REAL"
-            confidence = real_prob
-            
-        return label, confidence
-
-# Khởi tạo engine với đường dẫn model thực tế (chưa có)
-engine = ONNXDeepfakeEngine(model_path="engine_path_chưa_có")
+    def predict_fake_prob(self, crop_bgr_224: np.ndarray) -> float:
+        """Probability that the face crop is FAKE (softmax over the two logits)."""
+        x = preprocess_crop(crop_bgr_224)
+        logits = self.session.run([self.output_name], {self.input_name: x})[0][0]
+        e = np.exp(logits - np.max(logits))
+        probs = e / e.sum()
+        return float(probs[IDX_FAKE])
 
 
-# CƠ CHẾ TEMPORAL SMOOTHING (EMA)
+@lru_cache(maxsize=1)
+def get_engine() -> ONNXDeepfakeEngine:
+    return ONNXDeepfakeEngine()
+
+
+@lru_cache(maxsize=1)
+def get_cropper() -> FaceCropper:
+    return FaceCropper()
+
+
+# TEMPORAL SMOOTHING (EMA)
 class TemporalSmoother:
-    """
-    Lọc mượt xác suất dự đoán qua thời gian để tránh nhấp nháy nhãn trên video/webcam.
-    """
-    def __init__(self, alpha=0.6):
+    """Smooths P(fake) over time so the label does not flicker on video/webcam."""
+
+    def __init__(self, alpha=EMA_ALPHA):
         self.alpha = alpha
         self.current_score = None
 
@@ -88,101 +93,124 @@ class TemporalSmoother:
         self.current_score = None
 
 
-# PIPELINE XỬ LÝ VIDEO (TAB 1)
+# PER-STREAM ANALYSER (one per video or per webcam session)
+@dataclass
+class Verdict:
+    label: str = "ANALYZING..."
+    confidence: float = 0.0                 # percent, only meaningful for FAKE/REAL
+    color: Tuple[int, int, int] = GRAY
+    box: Optional[Tuple[int, int, int, int]] = None
+
+    def text(self) -> str:
+        if self.label.startswith(("FAKE", "REAL")):
+            return f"{self.label} ({self.confidence:.1f}%)"
+        return self.label
+
+
+class StreamAnalyzer:
+    def __init__(self):
+        self.smoother = TemporalSmoother()
+        self.misses = 0
+        self.verdict = Verdict()
+        self.last_sample_t = 0.0
+
+    def analyze(self, frame_bgr: np.ndarray) -> Verdict:
+        crop = get_cropper().crop(frame_bgr)
+
+        if not crop.ok:
+            self.misses += 1
+            if self.misses >= MAX_MISSES:
+                self.smoother.reset()
+                label = "LOW QUALITY" if crop.image is not None else "NO FACE"
+                self.verdict = Verdict(label=label, color=GRAY, box=crop.box)
+            return self.verdict
+
+        self.misses = 0
+        score = self.smoother.update(get_engine().predict_fake_prob(crop.image))
+        if score > FAKE_THRESHOLD:
+            self.verdict = Verdict("FAKE (DEEPFAKE)", score * 100, RED, crop.box)
+        else:
+            self.verdict = Verdict("REAL", (1.0 - score) * 100, GREEN, crop.box)
+        return self.verdict
+
+    def due(self, now: float) -> bool:
+        if now - self.last_sample_t >= SAMPLE_INTERVAL_S:
+            self.last_sample_t = now
+            return True
+        return False
+
+
+def draw_overlay(img_bgr: np.ndarray, verdict: Verdict) -> np.ndarray:
+    if verdict.box is not None:
+        x1, y1, x2, y2 = verdict.box
+        cv2.rectangle(img_bgr, (x1, y1), (x2, y2), verdict.color, 2)
+    scale = max(0.6, img_bgr.shape[1] / 1000.0)
+    cv2.putText(img_bgr, f"Status: {verdict.text()}", (20, int(40 * scale) + 10),
+                cv2.FONT_HERSHEY_SIMPLEX, scale, verdict.color, 2, cv2.LINE_AA)
+    return img_bgr
+
+
+# VIDEO PIPELINE (TAB 1)
 def process_video_file(video_path):
     if not video_path:
         return None
 
     cap = cv2.VideoCapture(video_path)
-    fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+    if not cap.isOpened():
+        raise gr.Error("Không mở được video.")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    output_path = "output_demo.mp4"
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    out_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    out_file.close()
+    # H.264 via the ffmpeg binary bundled with imageio-ffmpeg: OpenCV's mp4v output does not
+    # play in browsers, and OpenCV's own H.264 support depends on the platform.
+    out = imageio_ffmpeg.write_frames(
+        out_file.name, (width, height), fps=fps, codec="libx264", pix_fmt_in="rgb24",
+        pix_fmt_out="yuv420p", macro_block_size=2, quality=7, ffmpeg_log_level="error")
+    out.send(None)
 
-    smoother = TemporalSmoother(alpha=0.6)
-    frame_interval = max(1, int(fps * 0.5))  # Lấy mẫu mỗi ~500ms (2 FPS)
-    
-    last_label = "PROCESSING..."
-    last_conf = 0.0
+    analyzer = StreamAnalyzer()
+    frame_interval = max(1, round(fps * SAMPLE_INTERVAL_S))   # ~2 analysed frames per second
     frame_idx = 0
-
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        # Sampling theo chu kỳ 2 FPS
-        if frame_idx % frame_interval == 0:
-            # [Lưu ý thực tế]: Có thể tích hợp MediaPipe Face Detection ở đây để crop mặt trước, 
-            # hoặc truyền trực tiếp frame nếu video đã được cắt mặt sẵn.
-            raw_label, raw_conf = engine.predict(frame)
-            
-            score_val = raw_conf if raw_label == "FAKE" else (1.0 - raw_conf)
-            smoothed_score = smoother.update(score_val)
-            
-            if smoothed_score > 0.5:
-                last_label = "FAKE (DEEPFAKE)"
-                last_conf = smoothed_score * 100
-                color = (0, 0, 255)
-            else:
-                last_label = "REAL"
-                last_conf = (1.0 - smoothed_score) * 100
-                color = (0, 255, 0)
-
-        cv2.putText(frame, f"Status: {last_label} ({last_conf:.1f}%)", (30, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
-        
-        out.write(frame)
-        frame_idx += 1
-
-    cap.release()
-    out.release()
-    return output_path
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx % frame_interval == 0:
+                analyzer.analyze(frame)
+            annotated = draw_overlay(frame, analyzer.verdict)
+            out.send(np.ascontiguousarray(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)))
+            frame_idx += 1
+    finally:
+        cap.release()
+        out.close()
+    return out_file.name
 
 
+# WEBCAM PIPELINE (TAB 2)
+def process_webcam_frame(frame_rgb, state):
+    """Gradio gives RGB frames; everything below works in BGR like OpenCV and the training crops."""
+    if frame_rgb is None:
+        return None, state
+    if state is None:
+        state = StreamAnalyzer()
 
-# PIPELINE WEBCAM REALTIME (TAB 2)
-smoother_webcam = TemporalSmoother(alpha=0.6)
-last_inference_time = 0
-cached_label = "AWAITING..."
-cached_conf = 0.0
-
-def process_webcam_frame(frame):
-    global last_inference_time, cached_label, cached_conf
-    if frame is None:
-        return None
-
-    current_time = time.time()
-    # Sampling theo chu kỳ 2 FPS
-    if current_time - last_inference_time >= 0.5:
-        raw_label, raw_conf = engine.predict(frame)
-        score_val = raw_conf if raw_label == "FAKE" else (1.0 - raw_conf)
-        smoothed_score = smoother_webcam.update(score_val)
-
-        if smoothed_score > 0.5:
-            cached_label = "FAKE (DEEPFAKE)"
-            cached_conf = smoothed_score * 100
-        else:
-            cached_label = "REAL"
-            cached_conf = (1.0 - smoothed_score) * 100
-            
-        last_inference_time = current_time
-
-    color = (0, 0, 255) if "FAKE" in cached_label else (0, 255, 0)
-    cv2.putText(frame, f"Realtime CPU: {cached_label} ({cached_conf:.1f}%)", (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
-    
-    return frame
+    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    if state.due(time.monotonic()):
+        state.analyze(frame_bgr)
+    annotated = draw_overlay(frame_bgr, state.verdict)
+    return cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), state
 
 
-
-# GIAO DIỆN GRADIO UI (WEB APP)
-with gr.Blocks(theme=gr.themes.Soft()) as demo:
+# GRADIO UI
+with gr.Blocks() as demo:
     gr.Markdown("# 🛡️ Real-time Deepfake Detection MVP (CPU-Optimized)")
-    gr.Markdown("Hệ thống kiểm chứng nhận diện Deepfake thời gian thực tối ưu cho CPU sử dụng ONNX Runtime, Frame Sampling & Temporal Smoothing.")
+    gr.Markdown(
+        "Hệ thống phát hiện Deepfake tối ưu cho CPU: MediaPipe cắt khuôn mặt (giống lúc huấn luyện), "
+        "ONNX Runtime, Frame Sampling 2 FPS và Temporal Smoothing.")
 
     with gr.Tabs():
         with gr.TabItem("📁 Phân tích Video"):
@@ -193,10 +221,15 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
             btn_run_video.click(fn=process_video_file, inputs=video_input, outputs=video_output)
 
         with gr.TabItem("📷 Live Webcam Stream"):
-            gr.Markdown("Hệ thống tự động lấy mẫu 2 FPS kết hợp ONNX Runtime INT8 để đảm bảo không giật lag trên CPU.")
+            gr.Markdown("Hệ thống tự động lấy mẫu 2 FPS để không giật lag trên CPU. Cần thấy rõ khuôn mặt, đủ sáng.")
+            webcam_state = gr.State(None)
             webcam_input = gr.Image(sources=["webcam"], streaming=True, label="Webcam trực tiếp")
             webcam_output = gr.Image(label="Kết quả nhận diện Realtime")
-            webcam_input.stream(fn=process_webcam_frame, inputs=webcam_input, outputs=webcam_output)
+            webcam_input.stream(fn=process_webcam_frame,
+                                inputs=[webcam_input, webcam_state],
+                                outputs=[webcam_output, webcam_state])
 
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=7860, share=False)
+    get_engine()    # fail fast with a clear message if the model file is missing
+    demo.launch(server_name="127.0.0.1", server_port=int(os.environ.get("FF_PORT", 7860)),
+                share=False, inbrowser=True, theme=gr.themes.Soft())
