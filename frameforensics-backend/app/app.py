@@ -231,5 +231,6 @@ with gr.Blocks() as demo:
 
 if __name__ == "__main__":
     get_engine()    # fail fast with a clear message if the model file is missing
-    demo.launch(server_name="127.0.0.1", server_port=int(os.environ.get("FF_PORT", 7860)),
-                share=False, inbrowser=True, theme=gr.themes.Soft())
+    port = int(os.environ.get("PORT", os.environ.get("FF_PORT", 7860)))
+    demo.launch(server_name="0.0.0.0", server_port=port,
+                share=False, inbrowser=False, theme=gr.themes.Soft())
