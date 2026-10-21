@@ -204,16 +204,37 @@ def process_video_file(video_path):
 # WEBCAM PIPELINE (TAB 2)
 def process_webcam_frame(frame_rgb, state):
     """Gradio gives RGB frames; everything below works in BGR like OpenCV and the training crops."""
-    if frame_rgb is None:
-        return None, state
-    if state is None:
-        state = StreamAnalyzer()
+    try:
+        if frame_rgb is None:
+            return None, state
+        if state is None:
+            state = StreamAnalyzer()
 
-    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-    if state.due(time.monotonic()):
-        state.analyze(frame_bgr)
-    annotated = draw_overlay(frame_bgr, state.verdict)
-    return cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), state
+        # Handle different types of input from Gradio (PIL Image, file path, numpy array)
+        if hasattr(frame_rgb, "convert"):
+            frame_rgb = np.array(frame_rgb.convert("RGB"))
+        elif isinstance(frame_rgb, str):
+            loaded = cv2.imread(frame_rgb)
+            if loaded is not None:
+                frame_rgb = cv2.cvtColor(loaded, cv2.COLOR_BGR2RGB)
+
+        if not isinstance(frame_rgb, np.ndarray):
+            return None, state
+
+        if frame_rgb.ndim == 3 and frame_rgb.shape[2] == 3:
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        else:
+            frame_bgr = frame_rgb
+
+        if state.due(time.monotonic()):
+            state.analyze(frame_bgr)
+        annotated = draw_overlay(frame_bgr, state.verdict)
+        return cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), state
+    except Exception as e:
+        print(f"[Webcam Error] {e}")
+        if frame_rgb is not None and isinstance(frame_rgb, np.ndarray):
+            return frame_rgb, state
+        return None, state
 
 
 # GRADIO UI
