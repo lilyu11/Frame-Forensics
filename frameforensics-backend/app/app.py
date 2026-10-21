@@ -9,7 +9,18 @@ from typing import Optional, Tuple
 
 import cv2
 import gradio as gr
-import imageio_ffmpeg
+try:
+    import imageio_ffmpeg
+    # Ensure imageio_ffmpeg binary is executable on Linux containers (Render, Docker, etc.)
+    try:
+        _ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if _ffmpeg_exe and os.path.exists(_ffmpeg_exe):
+            os.chmod(_ffmpeg_exe, 0o755)
+    except Exception:
+        pass
+except Exception:
+    imageio_ffmpeg = None
+
 import numpy as np
 import onnxruntime as ort
 

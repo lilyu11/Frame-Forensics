@@ -1,7 +1,8 @@
 FROM python:3.10-slim
 
-# Install system dependencies required for OpenCV and MediaPipe on Linux
+# Install system dependencies and build tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     libgl1 \
     libglib2.0-0 \
     ffmpeg \
@@ -9,12 +10,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy backend files
-COPY ./frameforensics-backend/ /app/
+# Copy requirements first for better caching
+COPY frameforensics-backend/requirements-app.txt /app/
 
-# Install Python dependencies
+# Upgrade pip and install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements-app.txt
+
+# Copy the rest of backend code
+COPY frameforensics-backend/ /app/
 
 EXPOSE 7860
 
