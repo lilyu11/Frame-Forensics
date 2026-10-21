@@ -1,7 +1,7 @@
-# Only what the Gradio app (app/app.py) needs at runtime. Training deps are in requirements.txt.
-# Versions are pinned to the ones the app was tested with.
-gradio==6.30.0
-onnxruntime==1.24.4
-mediapipe==0.10.35      # also installs opencv-contrib-python (cv2)
-numpy==2.3.5
-imageio-ffmpeg==0.6.0   # bundled ffmpeg for browser-playable H.264 output
+# Runtime dependencies for Gradio app (app/app.py)
+gradio
+onnxruntime
+mediapipe
+numpy
+imageio-ffmpeg
+
