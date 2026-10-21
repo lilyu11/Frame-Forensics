@@ -127,13 +127,22 @@ class StreamAnalyzer:
 
     def analyze(self, frame_bgr: np.ndarray) -> Verdict:
         crop = get_cropper().crop(frame_bgr)
+        print(f"[StreamAnalyzer] Status: {crop.status}, conf: {crop.face_conf:.2f}, blur: {crop.blur_score:.1f}")
 
         if not crop.ok:
             self.misses += 1
+            label_map = {
+                "no_face": "NO FACE",
+                "low_conf": f"LOW CONF ({crop.face_conf:.2f})",
+                "blurry": f"BLURRY ({int(crop.blur_score)})",
+                "small_face": "FACE TOO SMALL",
+                "empty_crop": "EMPTY CROP"
+            }
+            label = label_map.get(crop.status, "NO FACE")
+            # Immediately show bounding box if MediaPipe detected a face, even if quality gate failed
+            self.verdict = Verdict(label=label, color=GRAY, box=crop.box)
             if self.misses >= MAX_MISSES:
                 self.smoother.reset()
-                label = "LOW QUALITY" if crop.image is not None else "NO FACE"
-                self.verdict = Verdict(label=label, color=GRAY, box=crop.box)
             return self.verdict
 
         self.misses = 0
