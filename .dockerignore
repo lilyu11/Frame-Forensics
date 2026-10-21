@@ -1,0 +1,8 @@
+.venv
+archive
+__pycache__
+*.pyc
+.git
+.gitignore
+.vscode
+processed_data
