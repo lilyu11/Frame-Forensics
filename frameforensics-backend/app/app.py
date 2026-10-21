@@ -35,9 +35,9 @@ MODEL_PATH = Path(os.environ.get(
 IDX_FAKE, IDX_REAL = 0, 1
 
 FAKE_THRESHOLD = 0.5       # smoothed P(fake) above this => FAKE
-EMA_ALPHA = 0.6            # weight of the newest observation in the EMA
-SAMPLE_INTERVAL_S = 0.5    # analyse ~2 frames per second
-MAX_MISSES = 3             # consecutive sampled frames without a usable face before the verdict is dropped
+EMA_ALPHA = 0.5            # weight of the newest observation in the EMA
+SAMPLE_INTERVAL_S = 0.4    # analyse ~2.5 frames per second
+MAX_MISSES = 4             # consecutive sampled frames without a usable face before the verdict is dropped
 
 GREEN, RED, GRAY = (0, 255, 0), (0, 0, 255), (160, 160, 160)   # BGR
 

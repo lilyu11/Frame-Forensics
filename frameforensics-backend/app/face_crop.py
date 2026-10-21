@@ -31,9 +31,9 @@ import numpy as np
 # ---- Must match process_data.py ------------------------------------------------
 CROP_MARGIN = 0.30
 TARGET_SIZE = (224, 224)
-FACE_CONF_THRESHOLD = 0.5
-BLUR_THRESHOLD = 50.0
-MIN_BBOX_AREA_RATIO = 0.001
+FACE_CONF_THRESHOLD = 0.35
+BLUR_THRESHOLD = 20.0
+MIN_BBOX_AREA_RATIO = 0.005
 DETECTOR_MIN_CONFIDENCE = 0.1   # detector is permissive; the gates above do the filtering
 
 # ---- Must match the training transforms (val_transforms) ----------------------
